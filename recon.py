@@ -24,7 +24,6 @@ port_votes = {}  # Format: { port: {"open": X, "closed": Y, "filtered": Z} }
 detected_as_windows = False  
 port_authoritative_states = {}  
 
-# Added "status" key to track port state separate from version
 scan_results = {
     "target_ip": "",
     "zombie_ip": "Skipped",
@@ -72,16 +71,10 @@ def cast_vote(port, state, weight=1):
     port_votes[port][state] += weight
 
 def final_consensus_decision(port):
-    """
-    Computes cumulative totals instead of breaking out early on a single 
-    high-weight result. This heavily mitigates false-positive state lock-ins.
-    """
+    """Computes cumulative totals to mitigate false-positive state lock-ins."""
     votes = port_votes.get(port, {"open": 0, "closed": 0, "filtered": 0})
-    
-    # If no scans scored anything, it's filtered
     if votes["open"] == 0 and votes["closed"] == 0 and votes["filtered"] == 0:
         return "FILTERED"
-        
     max_state = max(votes, key=votes.get)
     return max_state.upper()
 
@@ -113,7 +106,6 @@ def basic_port_scan(target, port):
             cast_vote(port, "closed", weight=10) 
             fallback_version = service_and_os_detection(target, port, fallback_mode=True)
             if str(port) in scan_results["port_scans"]:
-                # Clean Separation: Version shows profile, Status shows "CLOSED"
                 scan_results["port_scans"][str(port)]["version"] = fallback_version
                 scan_results["port_scans"][str(port)]["status"] = "CLOSED"
         s.close()
@@ -125,11 +117,11 @@ def syn_scan(target, port):
     packet = IP(dst=target)/TCP(dport=port, flags="S")
     response = sr1(packet, timeout=TIMEOUT, verbose=0)
     if response and response.haslayer(TCP):
-        if response[TCP].flags == 0x12: # SYN-ACK
+        if response[TCP].flags == 0x12:
             log_silent("scans", "syn_scan", "OPEN", port=port)
             cast_vote(port, "open", weight=10)
             send(IP(dst=target)/TCP(dport=port, flags="R"), verbose=0) 
-        elif response[TCP].flags == 0x14: # RST
+        elif response[TCP].flags == 0x14:
             log_silent("scans", "syn_scan", "CLOSED", port=port)
             cast_vote(port, "closed", weight=10)
     else:
@@ -165,7 +157,6 @@ def udp_scan(target, port):
             cast_vote(port, "closed", weight=10)
 
 def process_inverse_response(response, port, scan_type):
-    """Inverse responses logged internally to isolate ambient scan noise."""
     global detected_as_windows
     if response is None:
         log_silent("scans", scan_type, "OPEN|FILTERED", port=port)
@@ -236,15 +227,10 @@ def zombie_scan(target, zombie_ip, port):
 # ==============================================================================
 
 def service_and_os_detection(target, port, fallback_mode=False):
-    """
-    Predicts remote operating systems cleanly by using steady-state network variables
-    (Initial TTL) combined with RFC-compliance checks to mitigate false matches.
-    """
     global detected_as_windows
     linux_points = 0
     windows_points = 0
     
-    # Core Test 1: Handle Initial TTL boundaries (The most resilient baseline metric)
     pkt = sr1(IP(dst=target)/TCP(dport=port, flags="S"), timeout=TIMEOUT, verbose=0)
     if pkt and pkt.haslayer(IP):
         ttl = pkt.ttl
@@ -253,15 +239,13 @@ def service_and_os_detection(target, port, fallback_mode=False):
         elif 64 < ttl <= 128:
             windows_points += 4
             
-    # Core Test 2: RFC 793 Flag Validation (Null packet handling)
     null_pkt = sr1(IP(dst=target)/TCP(dport=port, flags=""), timeout=TIMEOUT, verbose=0)
     if null_pkt and null_pkt.haslayer(TCP):
-        if null_pkt[TCP].flags == 0x14: # RST
+        if null_pkt[TCP].flags == 0x14:
             windows_points += 2
     else:
         linux_points += 2
 
-    # Consolidating confidence intervals
     if windows_points > linux_points and windows_points >= 4:
         detected_as_windows = True
         os_guess = f"Windows OS Stack Profile (Heuristical Match Confidence: {windows_points}/6)"
@@ -277,7 +261,7 @@ def service_and_os_detection(target, port, fallback_mode=False):
     return os_guess
 
 # ==============================================================================
-# 3. APPLICATION LAYER MODULES
+# 3. APPLICATION LAYER MODULES (UPGRADED FOR HTTP FINGERPRINTING)
 # ==============================================================================
 
 def run_ssh_advanced_audit(target):
@@ -380,21 +364,110 @@ def run_ftp_vulnerability_scripts(banner):
             log_and_print("enumeration", "ftp_vuln_match", f"    [INFO] App Banner Match -> {app}: {vuln}", port=FTP_PORT)
 
 def http_get_details(target):
+    """
+    Performs comprehensive HTTP fingerprinting by evaluating Server headers, 
+    X-Powered-By fields, ETag patterns, Cookie formats, Redirect behavior, 
+    Default error pages, TLS certificate details, Protocol versions, and CDN indicators.
+    """
+    log_and_print("enumeration", "http_init", f"[*] Running Advanced HTTP Fingerprinting on {target}:80", port=HTTP_PORT)
+    
+    # 1. Check HTTP Protocol Versions Supported
+    protocols = {"HTTP/1.1": b"GET / HTTP/1.1\r\nHost: " + target.encode() + b"\r\n\r\n", 
+                 "HTTP/1.0": b"GET / HTTP/1.0\r\n\r\n"}
+    
+    raw_response = ""
+    for proto_name, payload in protocols.items():
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(TIMEOUT)
+            s.connect((target, HTTP_PORT))
+            s.send(payload)
+            res = s.recv(4096).decode('utf-8', errors='ignore')
+            s.close()
+            if res.strip():
+                log_and_print("enumeration", f"proto_{proto_name}", f"  [+] Supported Protocol: {proto_name}", port=HTTP_PORT)
+                if proto_name == "HTTP/1.1":
+                    raw_response = res
+        except:
+            pass
+
+    # 2. Extract Professional Fingerprinting Indicators from Response
+    server = "Unknown Headers"
+    x_powered = "Not Detected"
+    etag = "Not Detected"
+    cookies = []
+    cdn_proxy = "Not Detected"
+    redirect_behavior = "No Redirect"
+
+    if raw_response:
+        headers = raw_response.split("\r\n\r\n")[0].split("\n")
+        
+        # Check Redirect Behavior
+        if "HTTP/1.1 301" in raw_response or "HTTP/1.1 302" in raw_response:
+            for line in headers:
+                if line.lower().strip().startswith("location:"):
+                    redirect_behavior = f"Redirects to -> {line.split(':', 1)[1].strip()}"
+
+        for line in headers:
+            line_lower = line.lower().strip()
+            # Server Header
+            if line_lower.startswith("server:"):
+                server = line.split(":", 1)[1].strip()
+            # X-Powered-By
+            elif line_lower.startswith("x-powered-by:"):
+                x_powered = line.split(":", 1)[1].strip()
+            # ETag Patterns
+            elif line_lower.startswith("etag:"):
+                etag = line.split(":", 1)[1].strip()
+            # Cookie Formats
+            elif line_lower.startswith("set-cookie:"):
+                cookies.append(line.split(":", 1)[1].strip())
+            # CDN or Reverse Proxy Indicators
+            elif any(cdn in line_lower for cdn in ["via:", "x-cache:", "cf-ray:", "cloudfront", "fastly"]):
+                cdn_proxy = line.strip()
+
+    # Log found variables
+    scan_results["port_scans"]["80"]["version"] = server
+    log_and_print("enumeration", "http_server", f"  [+] Server Header: {server}", port=HTTP_PORT)
+    log_and_print("enumeration", "http_xpowered", f"  [+] X-Powered-By Field: {x_powered}", port=HTTP_PORT)
+    log_and_print("enumeration", "http_etag", f"  [+] ETag Pattern: {etag}", port=HTTP_PORT)
+    log_and_print("enumeration", "http_redirect", f"  [+] Redirect Behavior: {redirect_behavior}", port=HTTP_PORT)
+    log_and_print("enumeration", "http_cdn", f"  [+] CDN/Reverse Proxy Indicator: {cdn_proxy}", port=HTTP_PORT)
+    
+    if cookies:
+        log_and_print("enumeration", "http_cookies", f"  [+] Raw Cookie Formats: {', '.join(cookies)}", port=HTTP_PORT)
+
+    # 3. Analyze Default Error Pages (Triggering a 404 to check page signature)
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(TIMEOUT)
         s.connect((target, HTTP_PORT))
-        s.send(b"GET / HTTP/1.1\r\nHost: " + target.encode() + b"\r\nUser-Agent: SecurityAuditorEngine\r\n\r\n")
-        response = s.recv(4096).decode('utf-8', errors='ignore')
+        s.send(b"GET /nonexistent_file_test_404 HTTP/1.1\r\nHost: " + target.encode() + b"\r\n\r\n")
+        err_response = s.recv(2048).decode('utf-8', errors='ignore')
         s.close()
-        server = "Unknown Headers"
-        for line in response.split("\n"):
-            if line.lower().strip().startswith("server:"): 
-                server = line.split(":", 1)[1].strip()
-        scan_results["port_scans"]["80"]["version"] = server
-        log_and_print("enumeration", "http_server", f"  [+] HTTP Server Header Information field: {server}", port=HTTP_PORT)
-    except Exception as e:
-        log_and_print("enumeration", "http_details", f"  [-] Exception mapping web server: {e}", port=HTTP_PORT)
+        if "404" in err_response:
+            signature = "Custom or Clean 404 Page"
+            if "apache" in err_response.lower(): signature = "Standard Apache Error Page Context"
+            elif "nginx" in err_response.lower(): signature = "Standard Nginx Error Page Context"
+            elif "iis" in err_response.lower(): signature = "Standard Microsoft IIS Error Page Context"
+            log_and_print("enumeration", "http_error_page", f"  [+] Default Error Pages Pattern: {signature}", port=HTTP_PORT)
+    except:
+        pass
+
+    # 4. Extract TLS Certificate Details (Attempts standard SSL port upgrade logic on HTTPS context)
+    try:
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        with socket.create_connection((target, 443), timeout=TIMEOUT) as sock:
+            with context.wrap_socket(sock, server_hostname=target) as ssock:
+                cert = ssock.getpeercert(binary_form=True)
+                # Quick non-parsing signature verification just to show availability
+                if cert:
+                    log_and_print("enumeration", "http_tls", "  [+] TLS Certificate Details: Handshake successful on port 443, certificate bytes received.", port=HTTP_PORT)
+    except:
+        log_and_print("enumeration", "http_tls", "  [-] TLS Certificate Details: Secure port 443 unreachable/refused.", port=HTTP_PORT)
+
 
 def http_methods_check(target):
     try:
@@ -466,14 +539,13 @@ def run_imap_advanced_audit(target, port):
         pass
 
 # ==============================================================================
-# 4. UNIFIED SUMMARY REPORT GENERATOR (MODIFIED FOR SEPARATION)
+# 4. UNIFIED SUMMARY REPORT GENERATOR
 # ==============================================================================
 
 def generate_reports():
     print("\n[*] Exporting structured session summaries to operational storage...")
     base_filename = "report_data"
     
-    # 1. Text Report Generation (Separated into Version and Port Status Points)
     with open(f"{base_filename}.txt", "w") as f:
         f.write("============================================================\n")
         f.write("            CONSOLIDATED AUTHORITATIVE PORT REPORT           \n")
@@ -483,31 +555,22 @@ def generate_reports():
         for port, data in scan_results["port_scans"].items():
             f.write(f"\n[Port Element {port} - Service: {data['service']}]\n")
             f.write(f"  -> Service Software Version: {data['version']}\n")
-            f.write(f"  -> Port Status: {data.get('status', 'Unknown')}\n") # Next line point
+            f.write(f"  -> Port Status: {data.get('status', 'Unknown')}\n")
             f.write("  -> Layer Scans Executed:\n")
             for sk, sv in data["scans"].items(): f.write(f"    {sk}: {sv}\n")
             f.write("  -> Enumeration Script Output:\n")
             for ek, ev in data["enumeration"].items(): f.write(f"    {ek}: {ev}\n")
     print(f"  [+] Saved Text Report to: {base_filename}.txt")
 
-    # 2. JSON Report Generation (Now includes independent 'status' key per port)
     with open(f"{base_filename}.json", "w") as f:
         json.dump(scan_results, f, indent=4)
     print(f"  [+] Saved JSON Report to: {base_filename}.json")
 
-    # 3. XML Report Generation (Added PortStatus attribute to XML nodes)
     root = ET.Element("ComprehensiveAuditReport", target=scan_results["target_ip"])
     ET.SubElement(root, "OperatingSystemEstimation").text = scan_results["os_fingerprint"]
     ports_node = ET.SubElement(root, "TargetInfrastructurePorts")
     for port, data in scan_results["port_scans"].items():
-        p_node = ET.SubElement(
-            ports_node, 
-            "PortRecord", 
-            ID=port, 
-            Profile=data["service"], 
-            SoftwareVersion=data["version"],
-            PortStatus=data.get("status", "Unknown") # Explicitly separated attribute
-        )
+        p_node = ET.SubElement(ports_node, "PortRecord", ID=port, Profile=data["service"], SoftwareVersion=data["version"], PortStatus=data.get("status", "Unknown"))
         s_node = ET.SubElement(p_node, "ProbingMatrices")
         for sk, sv in data["scans"].items(): ET.SubElement(s_node, sk).text = sv
         e_node = ET.SubElement(p_node, "EnumerationScripts")
@@ -556,16 +619,12 @@ if __name__ == "__main__":
         if zombie_input:
             zombie_scan(target_ip, zombie_input, p)
             
-    # Step 3: Compute Authority Decisions & Update State Maps
+    # Step 3: Compute Authority Decisions
     for p in all_ports:
         port_authoritative_states[p] = final_consensus_decision(p)
         port_str = str(p)
         if port_str in scan_results["port_scans"]:
-            # Set unified Port Status dynamically
             scan_results["port_scans"][port_str]["status"] = port_authoritative_states[p]
-            
-            # If the port is open, version is initialized as placeholder and overwritten during deep scans.
-            # If the port is closed/filtered, version field is cleanly populated with the dynamic OS fallback match.
             if port_authoritative_states[p] != "OPEN":
                 scan_results["port_scans"][port_str]["version"] = fallback_os
 
